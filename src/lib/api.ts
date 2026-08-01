@@ -48,7 +48,16 @@ export class ApiError extends Error {
   }
 }
 
+export interface StatusReport {
+  storage: "sqlite" | "postgres" | "memory";
+  ephemeral: boolean;
+  blobConfigured: boolean;
+  generationConfigured: boolean;
+}
+
 export const api = {
+  status: () => request<StatusReport>("/api/status"),
+
   listDecks: () => request<{ decks: DeckSummary[] }>("/api/decks").then((r) => r.decks),
 
   getDeck: (id: string) => request<StoredDeck>(`/api/decks/${id}`),

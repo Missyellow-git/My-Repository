@@ -1,16 +1,7 @@
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
-import path from "node:path";
-import { db, newId, UPLOAD_DIR } from "./db";
+import { drivers, newId, type AssetRecord } from "./store";
 
-export interface AssetRecord {
-  id: string;
-  sha256: string;
-  media_type: string;
-  filename: string;
-  size: number;
-  created_at: number;
-}
+/** Image storage: validation, content addressing, and driver dispatch. */
 
 export interface AssetDto {
   id: string;
@@ -24,23 +15,27 @@ export interface AssetDto {
 const ALLOWED = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 
+export class AssetError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+  }
+}
+
 export function assetUrl(id: string) {
   return `/api/assets/${id}`;
 }
 
-export function toDto(row: AssetRecord): AssetDto {
+export function toDto(record: AssetRecord): AssetDto {
   return {
-    id: row.id,
-    name: row.filename,
-    mediaType: row.media_type,
-    size: row.size,
-    url: assetUrl(row.id),
+    id: record.id,
+    name: record.filename,
+    mediaType: record.mediaType,
+    size: record.size,
+    url: assetUrl(record.id),
   };
-}
-
-/** Blobs are sharded by the first byte of the digest to keep directories small. */
-function blobPath(sha256: string) {
-  return path.join(UPLOAD_DIR, sha256.slice(0, 2), sha256);
 }
 
 export async function storeAsset(
@@ -55,85 +50,62 @@ export async function storeAsset(
     throw new AssetError("That image is larger than 10 MB.", 413);
   }
 
+  const { assets } = await drivers();
   const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
 
-  // Identical bytes uploaded twice reuse the first asset rather than writing a
+  // Identical bytes uploaded twice reuse the first asset rather than storing a
   // second copy — decks that share an image share the underlying blob.
-  const existing = db()
-    .prepare<[string], AssetRecord>("SELECT * FROM assets WHERE sha256 = ?")
-    .get(sha256);
+  const existing = await assets.findByDigest(sha256);
   if (existing) return toDto(existing);
 
-  const target = blobPath(sha256);
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, bytes);
+  const created = await assets.create(
+    {
+      id: newId("asset"),
+      sha256,
+      mediaType,
+      filename: filename.slice(0, 200) || "image",
+      size: bytes.length,
+      location: sha256,
+      createdAt: Date.now(),
+    },
+    bytes
+  );
 
-  const row: AssetRecord = {
-    id: newId("asset"),
-    sha256,
-    media_type: mediaType,
-    filename: filename.slice(0, 200) || "image",
-    size: bytes.length,
-    created_at: Date.now(),
-  };
-
-  db()
-    .prepare(
-      `INSERT INTO assets (id, sha256, media_type, filename, size, created_at)
-       VALUES (@id, @sha256, @media_type, @filename, @size, @created_at)`
-    )
-    .run(row);
-
-  return toDto(row);
+  return toDto(created);
 }
 
-export function getAsset(id: string): AssetRecord | undefined {
-  return db().prepare<[string], AssetRecord>("SELECT * FROM assets WHERE id = ?").get(id);
+export async function getAsset(id: string): Promise<AssetRecord | null> {
+  return (await drivers()).assets.get(id);
 }
 
-export function listAssets(): AssetDto[] {
-  return db()
-    .prepare<[], AssetRecord>("SELECT * FROM assets ORDER BY created_at DESC")
-    .all()
-    .map(toDto);
+export async function listAssets(): Promise<AssetDto[]> {
+  return (await drivers()).assets.list().then((records) => records.map(toDto));
 }
 
-export function readAssetBytes(record: AssetRecord): Promise<Buffer> {
-  return fs.readFile(blobPath(record.sha256));
+export async function readAssetBytes(record: AssetRecord): Promise<Buffer> {
+  return (await drivers()).assets.read(record);
+}
+
+export async function assetPublicUrl(record: AssetRecord): Promise<string | null> {
+  return (await drivers()).assets.publicUrl(record);
 }
 
 /**
- * Deleting the row always succeeds; the blob is only removed once no asset
- * references that digest, since uploads are deduplicated by content.
+ * Removing the row always succeeds; the stored bytes are only dropped once no
+ * asset shares that digest, since uploads are deduplicated by content.
  */
 export async function deleteAsset(id: string): Promise<boolean> {
-  const record = getAsset(id);
+  const { assets } = await drivers();
+  const record = await assets.get(id);
   if (!record) return false;
 
-  db().prepare("DELETE FROM assets WHERE id = ?").run(id);
-
-  const stillUsed = db()
-    .prepare<[string], { n: number }>("SELECT COUNT(*) AS n FROM assets WHERE sha256 = ?")
-    .get(record.sha256);
-  if (!stillUsed?.n) {
-    await fs.rm(blobPath(record.sha256), { force: true });
-  }
+  const sameDigest = await assets.findByDigest(record.sha256);
+  const digestStillUsed = Boolean(sameDigest && sameDigest.id !== record.id);
+  await assets.remove(record, digestStillUsed);
   return true;
 }
 
-/** Decks that still point at this asset — used to warn before deleting. */
-export function decksReferencing(id: string): number {
-  const row = db()
-    .prepare<[string], { n: number }>("SELECT COUNT(*) AS n FROM decks WHERE data LIKE ?")
-    .get(`%${assetUrl(id)}%`);
-  return row?.n ?? 0;
-}
-
-export class AssetError extends Error {
-  constructor(
-    message: string,
-    readonly status: number
-  ) {
-    super(message);
-  }
+/** Decks that still point at this asset — used to refuse a destructive delete. */
+export async function decksReferencing(id: string): Promise<number> {
+  return (await drivers()).decks.countReferencing(assetUrl(id));
 }

@@ -6,7 +6,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  return NextResponse.json({ decks: listDecks() });
+  return NextResponse.json({ decks: await listDecks() });
 }
 
 export async function POST(request: Request) {
@@ -20,7 +20,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "A deck with at least one slide is required." }, { status: 400 });
   }
 
-  const stored = createDeck({
+  const stored = await createDeck({
     deck: body.deck,
     caption: body.caption ?? null,
     hashtags: body.hashtags ?? [],

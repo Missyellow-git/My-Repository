@@ -7,7 +7,7 @@ import Inspector from "./Inspector";
 import SlideCanvas from "./SlideCanvas";
 import SlideStrip from "./SlideStrip";
 import { Button } from "./ui";
-import { api, type DeckSummary } from "@/lib/api";
+import { api, type DeckSummary, type StatusReport } from "@/lib/api";
 import { buildDeck, imageElement, recolorDeck, uid } from "@/lib/layout";
 import { SAMPLE_DECK } from "@/lib/sample";
 import { getTheme, THEMES, DEFAULT_THEME_ID } from "@/lib/themes";
@@ -44,6 +44,7 @@ export default function Studio() {
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [status, setStatus] = useState<StatusReport | null>(null);
   const [restored, setRestored] = useState(false);
 
   /** Serialised copy of what the server last accepted, so autosave can skip
@@ -96,13 +97,15 @@ export default function Studio() {
     (async () => {
       setLibraryLoading(true);
       try {
-        const [serverAssets, serverDecks] = await Promise.all([
+        const [serverAssets, serverDecks, serverStatus] = await Promise.all([
           api.listAssets(),
           api.listDecks(),
+          api.status().catch(() => null),
         ]);
         if (cancelled) return;
         setAssets(serverAssets);
         setDecks(serverDecks);
+        setStatus(serverStatus);
 
         const imported = await importLegacyDeck(serverDecks.length === 0);
         if (cancelled) return;
@@ -560,6 +563,8 @@ export default function Studio() {
         onShowCaption={() => setShowCaption(true)}
       />
 
+      {status && <StatusBanner status={status} />}
+
       <div className="flex min-h-0 flex-1">
         <aside className="w-[320px] shrink-0 border-r border-[#262a32] bg-[#131519]">
           <GeneratePanel
@@ -770,6 +775,31 @@ function TopBar({
         {exporting ? "Rendering…" : "Export PNGs"}
       </Button>
     </header>
+  );
+}
+
+/**
+ * A deployment missing its storage or API key still runs, so say which part is
+ * degraded rather than letting someone edit for an hour and lose it.
+ */
+function StatusBanner({ status }: { status: StatusReport }) {
+  const problems: string[] = [];
+  if (status.ephemeral) {
+    problems.push(
+      "Demo mode: this deployment has no database, so decks are kept in memory and disappear when the server restarts. Set POSTGRES_URL to make them permanent, and use .json to save work in the meantime."
+    );
+  } else if (status.storage === "postgres" && !status.blobConfigured) {
+    problems.push("Decks persist, but uploaded images do not — set BLOB_READ_WRITE_TOKEN.");
+  }
+  if (!status.generationConfigured) {
+    problems.push("ANTHROPIC_API_KEY is not set, so generation is unavailable.");
+  }
+  if (!problems.length) return null;
+
+  return (
+    <div className="shrink-0 border-b border-[#4a3a1a] bg-[#241c0c] px-4 py-2 text-[11px] leading-relaxed text-[#e2c07a]">
+      {problems.join(" ")}
+    </div>
   );
 }
 

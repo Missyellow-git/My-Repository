@@ -1,8 +1,17 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Playwright launches a real browser binary — it must not be bundled.
-  serverExternalPackages: ["playwright-core"],
+  /**
+   * These all load real binaries or native bindings and must stay outside the
+   * bundle: the browser launcher, its serverless Chromium build, the SQLite
+   * addon, and the Postgres client.
+   */
+  serverExternalPackages: [
+    "playwright-core",
+    "@sparticuz/chromium",
+    "better-sqlite3",
+    "pg",
+  ],
 };
 
 export default nextConfig;

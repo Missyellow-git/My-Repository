@@ -9,7 +9,16 @@ import path from "node:path";
  * Postgres or S3 later is a change in two files rather than everywhere.
  */
 
-export const DATA_DIR = path.resolve(process.env.DATA_DIR ?? ".data");
+/**
+ * Serverless filesystems are read-only apart from /tmp. Falling back there
+ * keeps the app from crashing when it runs without Postgres configured — the
+ * data does not survive the instance, which `isEphemeral()` reports to the UI.
+ */
+const DEFAULT_DIR = process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME
+  ? "/tmp/carousel-studio"
+  : ".data";
+
+export const DATA_DIR = path.resolve(process.env.DATA_DIR ?? DEFAULT_DIR);
 export const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 
 let instance: Database.Database | null = null;
@@ -60,7 +69,3 @@ function migrate(handle: Database.Database) {
   `);
 }
 
-export function newId(prefix: string) {
-  const random = Math.random().toString(36).slice(2, 10);
-  return `${prefix}_${Date.now().toString(36)}${random}`;
-}

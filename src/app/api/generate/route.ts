@@ -64,11 +64,11 @@ export async function POST(request: Request) {
 async function loadImages(assetIds: string[]) {
   const images: { mediaType: string; data: string }[] = [];
   for (const id of assetIds.slice(0, 6)) {
-    const record = getAsset(id);
+    const record = await getAsset(id);
     if (!record) continue;
     try {
       const bytes = await readAssetBytes(record);
-      images.push({ mediaType: record.media_type, data: bytes.toString("base64") });
+      images.push({ mediaType: record.mediaType, data: bytes.toString("base64") });
     } catch {
       // A missing blob just means Claude writes without that image.
     }

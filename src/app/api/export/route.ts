@@ -6,7 +6,7 @@ import { slideToDocument } from "@/lib/render";
 import { ASPECTS, type Deck } from "@/lib/types";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+export const maxDuration = 60;
 
 /**
  * Renders each slide in headless Chromium and returns a ZIP of PNGs.
@@ -73,13 +73,29 @@ export async function POST(request: Request) {
   }
 }
 
+const SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
 /**
  * Prefer the bundled Chromium, but fall back to a system one so the app works
  * on hosts where Playwright's browsers aren't installed.
+ *
+ * Serverless is a separate path: Playwright's Chromium (~170 MB) blows the
+ * function bundle limit, so `@sparticuz/chromium` ships a compressed build that
+ * unpacks into /tmp at cold start.
  */
 async function launch(): Promise<Browser> {
   const explicit = process.env.CHROMIUM_EXECUTABLE_PATH;
   const args = ["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"];
+
+  if (SERVERLESS && !explicit) {
+    const pack = (await import("@sparticuz/chromium")).default;
+    return chromium.launch({
+      executablePath: await pack.executablePath(),
+      args: [...pack.args, "--font-render-hinting=none"],
+      headless: true,
+    });
+  }
+
   if (explicit) return chromium.launch({ executablePath: explicit, args });
   try {
     return await chromium.launch({ args });

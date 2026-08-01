@@ -5,7 +5,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  return NextResponse.json({ assets: listAssets() });
+  return NextResponse.json({ assets: await listAssets() });
 }
 
 export async function POST(request: Request) {

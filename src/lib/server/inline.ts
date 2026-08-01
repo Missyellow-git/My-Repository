@@ -44,11 +44,11 @@ export async function inlineDeckAssets(deck: Deck): Promise<Deck> {
 }
 
 async function toDataUrl(id: string): Promise<string | null> {
-  const record = getAsset(id);
+  const record = await getAsset(id);
   if (!record) return null;
   try {
     const bytes = await readAssetBytes(record);
-    return `data:${record.media_type};base64,${bytes.toString("base64")}`;
+    return `data:${record.mediaType};base64,${bytes.toString("base64")}`;
   } catch {
     // A missing blob shouldn't fail the whole export — that slide renders
     // without the image instead.
