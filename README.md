@@ -34,12 +34,50 @@ If you already have Chromium or Chrome somewhere else, point at it instead:
 CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium npm run dev
 ```
 
+## Deploying to Vercel
+
+Import the repository at [vercel.com/new](https://vercel.com/new) and pick this
+branch. The framework, build command, and output directory are all detected —
+there is nothing to override.
+
+Then set these in **Project → Settings → Environment Variables**:
+
+| Variable | Needed for | Where it comes from |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | generating carousels | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
+| `POSTGRES_URL` | decks surviving a restart | Vercel Marketplace → Neon (sets it for you) |
+| `BLOB_READ_WRITE_TOKEN` | uploaded images surviving a restart | Vercel Storage → Blob (sets it for you) |
+
+None of them are required to boot. With none set, the app runs in demo mode —
+the sample deck, the full editor, and PNG export all work, and a banner says
+decks are being kept in memory. Each variable you add lights up the
+corresponding feature; `/api/status` reports what the deployment can actually do.
+
+Two things the serverless build handles that a local one doesn't:
+
+- **PNG export** swaps Playwright's ~170 MB Chromium (which blows the function
+  bundle limit) for `@sparticuz/chromium`, a compressed build that unpacks into
+  `/tmp` on cold start. `/api/export` runs with `maxDuration = 60`.
+- **`better-sqlite3` is an optional dependency**, so an install that can't build
+  the native module still succeeds. Serverless never loads it — with no
+  `POSTGRES_URL` the driver selection skips SQLite entirely rather than writing
+  to a disk that gets wiped.
+
 ## Storage
 
-| What | Where |
-| --- | --- |
-| Decks (JSON + title, theme, aspect, caption, hashtags) | `.data/carousel.db` — SQLite |
-| Uploaded images | `.data/uploads/<xx>/<sha256>` |
+Three drivers, selected automatically at runtime — nothing outside
+`src/lib/server/` knows which one is active.
+
+| Driver | Chosen when | Decks | Images |
+| --- | --- | --- | --- |
+| `sqlite` | default (local, self-hosted) | `.data/carousel.db` | `.data/uploads/<xx>/<sha256>` |
+| `postgres` | `POSTGRES_URL` is set | Postgres `decks` table | Vercel Blob (`BLOB_READ_WRITE_TOKEN`) |
+| `memory` | serverless with no `POSTGRES_URL` | in-process, per instance | in-process, per instance |
+
+The `memory` driver exists so a serverless deployment with nothing provisioned
+still runs — you can generate, edit, and export — without pretending the data is
+durable. `GET /api/status` reports which driver is live, and the app shows a
+banner saying so rather than accepting an hour of edits it is going to lose.
 
 Every edit **autosaves**, debounced, with the state shown in the toolbar
 (*Unsaved changes → Saving… → Saved*). The header's **Decks** button opens a
@@ -57,9 +95,10 @@ Decks used to live in `localStorage`. On first run the app imports what's there
 into the database and clears the old key, so an upgrade doesn't look like lost
 work.
 
-Everything touching persistence is behind `src/lib/server/{db,decks,assets}.ts`.
-Swapping SQLite for Postgres, or the disk for S3, is a change in those files
-rather than across the app.
+Everything touching persistence is behind `src/lib/server/`. `store.ts` holds the
+driver contracts and picks one; `drivers/{sqlite,postgres,memory}.ts` implement
+them. Adding S3, or swapping the database again, is a new file in `drivers/`
+rather than a change across the app.
 
 ## How it works
 
