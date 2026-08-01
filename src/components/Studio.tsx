@@ -1,18 +1,31 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import GeneratePanel, { type Asset, type GenerateRequest } from "./GeneratePanel";
+import DeckLibrary from "./DeckLibrary";
+import GeneratePanel, { type GenerateRequest } from "./GeneratePanel";
 import Inspector from "./Inspector";
 import SlideCanvas from "./SlideCanvas";
 import SlideStrip from "./SlideStrip";
 import { Button } from "./ui";
+import { api, type DeckSummary } from "@/lib/api";
 import { buildDeck, imageElement, recolorDeck, uid } from "@/lib/layout";
 import { SAMPLE_DECK } from "@/lib/sample";
 import { getTheme, THEMES, DEFAULT_THEME_ID } from "@/lib/themes";
 import { useDeckHistory } from "@/lib/useDeckHistory";
-import { ASPECTS, type AspectId, type Deck, type Slide, type SlideElement } from "@/lib/types";
+import {
+  ASPECTS,
+  type Asset,
+  type AspectId,
+  type Deck,
+  type Slide,
+  type SlideElement,
+} from "@/lib/types";
 
-const STORAGE_KEY = "carousel-studio:v1";
+/** Pre-database autosave key; still read once so old work is migrated, not lost. */
+const LEGACY_STORAGE_KEY = "carousel-studio:v1";
+const LAST_DECK_KEY = "carousel-studio:last-deck";
+
+type SaveState = "idle" | "dirty" | "saving" | "saved" | "error";
 
 export default function Studio() {
   const { deck, commit, live, snapshot, replace, undo, redo, canUndo, canRedo } = useDeckHistory();
@@ -26,7 +39,16 @@ export default function Studio() {
   const [caption, setCaption] = useState<{ text: string; hashtags: string[] } | null>(null);
   const [showCaption, setShowCaption] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [deckId, setDeckId] = useState<string | null>(null);
+  const [decks, setDecks] = useState<DeckSummary[]>([]);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
   const [restored, setRestored] = useState(false);
+
+  /** Serialised copy of what the server last accepted, so autosave can skip
+   *  no-op writes (opening a deck, or an edit that lands back where it was). */
+  const savedSnapshot = useRef<string>("");
 
   const [stage, setStage] = useState({ width: 0, height: 0 });
   const observerRef = useRef<ResizeObserver | null>(null);
@@ -36,37 +58,116 @@ export default function Studio() {
 
   // --- persistence ----------------------------------------------------------
 
-  useEffect(() => {
+  const refreshDecks = useCallback(async () => {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const saved = JSON.parse(raw) as {
-          deck?: Deck;
-          assets?: Asset[];
-          caption?: { text: string; hashtags: string[] };
-        };
-        if (saved.deck?.slides?.length) {
-          replace(saved.deck);
-          setThemeId(saved.deck.themeId);
-          setAspect(saved.deck.aspect);
-        }
-        if (saved.assets) setAssets(saved.assets);
-        if (saved.caption) setCaption(saved.caption);
-      }
+      setDecks(await api.listDecks());
     } catch {
-      // A corrupt or oversized entry shouldn't block the app from opening.
+      // The library just stays stale; editing is unaffected.
     }
-    setRestored(true);
-  }, [replace]);
+  }, []);
 
+  const openDeck = useCallback(
+    async (id: string) => {
+      try {
+        const stored = await api.getDeck(id);
+        replace(stored.deck);
+        setDeckId(stored.id);
+        setThemeId(stored.deck.themeId);
+        setAspect(stored.deck.aspect);
+        setCaption(
+          stored.caption ? { text: stored.caption, hashtags: stored.hashtags } : null
+        );
+        setSlideIndex(0);
+        setSelectedId(null);
+        savedSnapshot.current = snapshotOf(stored.deck, stored.caption, stored.hashtags);
+        setSaveState("saved");
+        localStorage.setItem(LAST_DECK_KEY, stored.id);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Couldn't open that deck.");
+      }
+    },
+    [replace]
+  );
+
+  // Initial load: assets, the deck list, and whichever deck was last open.
   useEffect(() => {
-    if (!restored) return;
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ deck, assets, caption }));
-    } catch {
-      // Data-URL images can blow the quota; losing autosave is better than crashing.
-    }
-  }, [deck, assets, caption, restored]);
+    let cancelled = false;
+
+    (async () => {
+      setLibraryLoading(true);
+      try {
+        const [serverAssets, serverDecks] = await Promise.all([
+          api.listAssets(),
+          api.listDecks(),
+        ]);
+        if (cancelled) return;
+        setAssets(serverAssets);
+        setDecks(serverDecks);
+
+        const imported = await importLegacyDeck(serverDecks.length === 0);
+        if (cancelled) return;
+        if (imported) {
+          setDecks(await api.listDecks());
+          await openDeck(imported);
+        } else {
+          const lastId = localStorage.getItem(LAST_DECK_KEY);
+          if (lastId && serverDecks.some((d) => d.id === lastId)) await openDeck(lastId);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : "Couldn't reach the server.");
+        }
+      } finally {
+        if (!cancelled) {
+          setLibraryLoading(false);
+          setRestored(true);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [openDeck]);
+
+  // Autosave: debounce edits, then create-or-update. Skipped when the payload
+  // matches what the server already has, so opening a deck doesn't write back.
+  useEffect(() => {
+    if (!restored || !deck) return;
+
+    const payload = snapshotOf(deck, caption?.text ?? null, caption?.hashtags ?? []);
+    if (payload === savedSnapshot.current) return;
+
+    setSaveState("dirty");
+    const timer = setTimeout(async () => {
+      setSaveState("saving");
+      const body = {
+        deck,
+        caption: caption?.text ?? null,
+        hashtags: caption?.hashtags ?? [],
+      };
+      try {
+        const stored = deckId ? await api.updateDeck(deckId, body) : await api.createDeck(body);
+        setDeckId(stored.id);
+        localStorage.setItem(LAST_DECK_KEY, stored.id);
+        savedSnapshot.current = payload;
+        setSaveState("saved");
+        void refreshDecks();
+      } catch {
+        setSaveState("error");
+      }
+    }, 800);
+
+    return () => clearTimeout(timer);
+  }, [deck, caption, deckId, restored, refreshDecks]);
+
+  // Don't let a browser close swallow the last few seconds of edits.
+  useEffect(() => {
+    if (saveState !== "dirty" && saveState !== "saving") return;
+    const warn = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [saveState]);
 
   // --- canvas sizing --------------------------------------------------------
 
@@ -256,12 +357,13 @@ export default function Studio() {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error ?? "Generation failed.");
-      replace(data.deck as Deck, { keepHistory: !!deck });
+      replace(data.deck as Deck);
       setCaption({ text: data.caption, hashtags: data.hashtags });
       setThemeId(request.themeId);
       setAspect(request.aspect);
       setSlideIndex(0);
       setSelectedId(null);
+      startNewRow();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Generation failed.");
     } finally {
@@ -269,12 +371,72 @@ export default function Studio() {
     }
   }
 
+  /** Point autosave at a fresh row, leaving whatever was open saved as-is. */
+  const startNewRow = useCallback(() => {
+    setDeckId(null);
+    savedSnapshot.current = "";
+    setSaveState("dirty");
+  }, []);
+
   const loadSample = useCallback(() => {
-    replace(buildDeck(SAMPLE_DECK, themeId, aspect), { keepHistory: !!deck });
+    replace(buildDeck(SAMPLE_DECK, themeId, aspect));
     setCaption({ text: SAMPLE_DECK.caption, hashtags: SAMPLE_DECK.hashtags });
     setSlideIndex(0);
     setSelectedId(null);
-  }, [aspect, deck, replace, themeId]);
+    startNewRow();
+  }, [aspect, replace, themeId, startNewRow]);
+
+  const newDeck = useCallback(() => {
+    replace(null);
+    setDeckId(null);
+    setCaption(null);
+    setSlideIndex(0);
+    setSelectedId(null);
+    savedSnapshot.current = "";
+    setSaveState("idle");
+    localStorage.removeItem(LAST_DECK_KEY);
+    setLibraryOpen(false);
+  }, [replace]);
+
+  const duplicateDeck = useCallback(
+    async (id: string) => {
+      try {
+        const copy = await api.duplicateDeck(id);
+        await refreshDecks();
+        await openDeck(copy.id);
+        setLibraryOpen(false);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Couldn't duplicate that deck.");
+      }
+    },
+    [openDeck, refreshDecks]
+  );
+
+  const removeDeck = useCallback(
+    async (id: string) => {
+      try {
+        await api.deleteDeck(id);
+        // Deleting the deck you're editing clears the canvas rather than
+        // leaving an editor pointed at a row that no longer exists.
+        if (id === deckId) newDeck();
+        await refreshDecks();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Couldn't delete that deck.");
+      }
+    },
+    [deckId, newDeck, refreshDecks]
+  );
+
+  const removeAsset = useCallback(async (id: string) => {
+    try {
+      await api.deleteAsset(id);
+      setAssets((current) => current.filter((asset) => asset.id !== id));
+    } catch (e) {
+      // A 409 means a saved deck still uses the image — say so rather than
+      // silently leaving it in the tray.
+      setError(e instanceof Error ? e.message : "Couldn't delete that image.");
+    }
+  }, []);
 
   async function exportZip() {
     if (!deck) return;
@@ -376,6 +538,12 @@ export default function Studio() {
         canRedo={canRedo}
         exporting={exporting}
         hasCaption={!!caption}
+        saveState={saveState}
+        deckCount={decks.length}
+        onOpenLibrary={() => {
+          setLibraryOpen(true);
+          void refreshDecks();
+        }}
         onTitleChange={(title) => commit((current) => ({ ...current, title }))}
         onThemeChange={(id) => {
           setThemeId(id);
@@ -397,7 +565,7 @@ export default function Studio() {
           <GeneratePanel
             assets={assets}
             onAddAssets={(next) => setAssets((current) => [...current, ...next])}
-            onRemoveAsset={(id) => setAssets((current) => current.filter((a) => a.id !== id))}
+            onRemoveAsset={removeAsset}
             themeId={themeId}
             onThemeChange={(id) => {
               setThemeId(id);
@@ -478,6 +646,22 @@ export default function Studio() {
       {showCaption && caption && (
         <CaptionDrawer caption={caption} onClose={() => setShowCaption(false)} />
       )}
+
+      {libraryOpen && (
+        <DeckLibrary
+          decks={decks}
+          currentId={deckId}
+          loading={libraryLoading}
+          onOpen={(id) => {
+            void openDeck(id);
+            setLibraryOpen(false);
+          }}
+          onDuplicate={(id) => void duplicateDeck(id)}
+          onDelete={(id) => void removeDeck(id)}
+          onNew={newDeck}
+          onClose={() => setLibraryOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -492,6 +676,9 @@ function TopBar({
   canRedo,
   exporting,
   hasCaption,
+  saveState,
+  deckCount,
+  onOpenLibrary,
   onTitleChange,
   onThemeChange,
   onAspectChange,
@@ -508,6 +695,9 @@ function TopBar({
   canRedo: boolean;
   exporting: boolean;
   hasCaption: boolean;
+  saveState: SaveState;
+  deckCount: number;
+  onOpenLibrary: () => void;
   onTitleChange: (title: string) => void;
   onThemeChange: (id: string) => void;
   onAspectChange: (aspect: AspectId) => void;
@@ -531,6 +721,12 @@ function TopBar({
       ) : (
         <span className="flex-1 text-[12px] text-[#5f6674]">No deck yet</span>
       )}
+
+      {deck && <SaveIndicator state={saveState} />}
+
+      <Button onClick={onOpenLibrary} title="Open a saved deck">
+        Decks{deckCount ? ` (${deckCount})` : ""}
+      </Button>
 
       <select
         value={themeId}
@@ -574,6 +770,25 @@ function TopBar({
         {exporting ? "Rendering…" : "Export PNGs"}
       </Button>
     </header>
+  );
+}
+
+function SaveIndicator({ state }: { state: SaveState }) {
+  const label: Record<SaveState, string> = {
+    idle: "",
+    dirty: "Unsaved changes",
+    saving: "Saving…",
+    saved: "Saved",
+    error: "Save failed — retrying on next edit",
+  };
+  const tone =
+    state === "error" ? "text-[#f27b7b]" : state === "saved" ? "text-[#5f6674]" : "text-[#8b93a1]";
+  if (!label[state]) return null;
+
+  return (
+    <span className={`shrink-0 text-[11px] ${tone}`} title="Decks autosave to the local database">
+      {label[state]}
+    </span>
   );
 }
 
@@ -753,6 +968,42 @@ function CaptionDrawer({
 }
 
 // --- helpers -----------------------------------------------------------------
+
+/** What autosave compares against; caption changes count as edits too. */
+function snapshotOf(deck: Deck, caption: string | null, hashtags: string[]) {
+  return JSON.stringify({ deck, caption, hashtags });
+}
+
+/**
+ * Decks used to live in localStorage. Import one on first run so upgrading
+ * doesn't look like the app lost your work, then drop the old key.
+ */
+async function importLegacyDeck(serverIsEmpty: boolean): Promise<string | null> {
+  if (!serverIsEmpty) return null;
+  const raw = localStorage.getItem(LEGACY_STORAGE_KEY);
+  if (!raw) return null;
+
+  try {
+    const saved = JSON.parse(raw) as {
+      deck?: Deck;
+      caption?: { text: string; hashtags: string[] } | null;
+    };
+    if (!saved.deck?.slides?.length) {
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      return null;
+    }
+    const stored = await api.createDeck({
+      deck: saved.deck,
+      caption: saved.caption?.text ?? null,
+      hashtags: saved.caption?.hashtags ?? [],
+    });
+    localStorage.removeItem(LEGACY_STORAGE_KEY);
+    return stored.id;
+  } catch {
+    // Leave the key in place so a later run can try again.
+    return null;
+  }
+}
 
 function round(n: number) {
   return Math.round(n * 100) / 100;

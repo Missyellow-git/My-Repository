@@ -18,6 +18,9 @@ npm run dev
 Open http://localhost:3000. Without an API key the app still runs — click
 **Load a sample deck** to explore the editor and the PNG export.
 
+There is nothing else to provision: decks go into a SQLite file and uploaded
+images onto disk, both under `.data/` (override with `DATA_DIR`).
+
 The PNG exporter renders slides in headless Chromium. `npm install` pulls in
 `playwright-core` but not a browser, so install one once:
 
@@ -30,6 +33,33 @@ If you already have Chromium or Chrome somewhere else, point at it instead:
 ```bash
 CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium npm run dev
 ```
+
+## Storage
+
+| What | Where |
+| --- | --- |
+| Decks (JSON + title, theme, aspect, caption, hashtags) | `.data/carousel.db` — SQLite |
+| Uploaded images | `.data/uploads/<xx>/<sha256>` |
+
+Every edit **autosaves**, debounced, with the state shown in the toolbar
+(*Unsaved changes → Saving… → Saved*). The header's **Decks** button opens a
+library to switch between decks, duplicate one, or delete one. Closing the tab
+mid-save prompts before you lose the last few seconds.
+
+**Images are referenced, not embedded.** An upload is stored once and the deck
+holds a `/api/assets/<id>` URL. Uploads are content-addressed by SHA-256, so
+uploading the same file twice reuses the first blob, and deleting an image that
+a saved deck still uses is refused rather than quietly breaking that deck.
+Because headless Chromium renders with no origin, the export route resolves
+those URLs to bytes from disk before rendering.
+
+Decks used to live in `localStorage`. On first run the app imports what's there
+into the database and clears the old key, so an upgrade doesn't look like lost
+work.
+
+Everything touching persistence is behind `src/lib/server/{db,decks,assets}.ts`.
+Swapping SQLite for Postgres, or the disk for S3, is a change in those files
+rather than across the app.
 
 ## How it works
 
@@ -84,9 +114,10 @@ switch can recolour a deck you've already hand-edited instead of regenerating it
 
 Elements snap to the type margins and the centre lines while you drag.
 
-Slides, elements, backgrounds, and uploaded images all live in one `Deck` object
-that autosaves to `localStorage`, so a refresh doesn't cost you work. **.json**
-in the toolbar downloads that object if you want to keep or version a deck.
+Slides, elements, and backgrounds all live in one `Deck` object that autosaves to
+the database, so a refresh reopens exactly where you left off. **.json** in the
+toolbar downloads that object if you want to keep a deck outside the app or
+check one into version control.
 
 ## Themes
 
@@ -104,25 +135,35 @@ src/
     api/generate/   Claude call + layout, returns a Deck
     api/extract/    fetches a URL and pulls out the article text
     api/export/     renders slides in Chromium, returns a ZIP of PNGs
+    api/decks/      deck CRUD + duplicate
+    api/assets/     image upload, serving, deletion
   components/
-    Studio.tsx      state, history, keyboard, orchestration
+    Studio.tsx      state, history, autosave, keyboard, orchestration
     SlideCanvas.tsx drag / resize / rotate / in-place text editing
     SlideView.tsx   pure slide rendering (canvas + thumbnails)
     Inspector.tsx   per-element and per-slide controls
+    DeckLibrary.tsx saved decks: open, duplicate, delete
   lib/
     types.ts        the Deck format
     render.ts       the single source of truth for how a slide looks
     layout.ts       slide copy + theme -> positioned elements
     themes.ts       palettes, fonts, background rules
     generate.ts     the Claude prompt and response schema
+    api.ts          typed client for the JSON API
+    server/
+      db.ts         SQLite connection + schema migration
+      decks.ts      deck queries
+      assets.ts     content-addressed image storage
+      inline.ts     resolves asset URLs to bytes for export
 ```
 
 ## Notes
 
-- Uploaded images are stored as data URLs inside the deck. That keeps export
-  self-contained and needs no file storage, but a deck with several large images
-  can exceed the `localStorage` quota — autosave fails quietly in that case, so
-  export the `.json` if a deck matters.
+- The database is a single file. Back it up by copying `.data/`, and reset
+  everything by deleting it — the schema is recreated on next start.
+- SQLite suits one editor at a time, which is what this is. Two browser tabs on
+  the same deck will last-write-wins each other; that's the point at which you'd
+  move `src/lib/server/` to Postgres.
 - Slide fonts use stacks that end in a generic family (`sans-serif`, `serif`), so
   the export doesn't silently change metrics on a machine that's missing the
   first choice.

@@ -13,7 +13,7 @@ import type {
   TextStyle,
   VAlign,
 } from "@/lib/types";
-import type { Asset } from "./GeneratePanel";
+import type { Asset } from "@/lib/types";
 import {
   Button,
   ColorInput,

@@ -124,6 +124,16 @@ export interface GeneratedDeck {
   slides: SlideContent[];
 }
 
+/** An uploaded image, as stored on the server and referenced by decks. */
+export interface Asset {
+  id: string;
+  name: string;
+  mediaType: string;
+  size: number;
+  /** Root-relative URL served by /api/assets/[id]. */
+  url: string;
+}
+
 export function canvasSize(deck: Deck) {
   return ASPECTS[deck.aspect];
 }

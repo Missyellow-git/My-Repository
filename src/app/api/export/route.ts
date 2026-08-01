@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import JSZip from "jszip";
 import { chromium, type Browser } from "playwright-core";
+import { inlineDeckAssets } from "@/lib/server/inline";
 import { slideToDocument } from "@/lib/render";
 import { ASPECTS, type Deck } from "@/lib/types";
 
@@ -33,6 +34,8 @@ export async function POST(request: Request) {
   let browser: Browser | null = null;
 
   try {
+    // Stored decks reference images by URL; the renderer needs the bytes.
+    const renderable = await inlineDeckAssets(deck);
     browser = await launch();
     const context = await browser.newContext({
       viewport: { width: w, height: h },
@@ -42,7 +45,7 @@ export async function POST(request: Request) {
     const zip = new JSZip();
     const slug = slugify(deck.title);
 
-    for (const [index, slide] of deck.slides.entries()) {
+    for (const [index, slide] of renderable.slides.entries()) {
       await page.setContent(slideToDocument(slide, w, h), { waitUntil: "load" });
       // Background images and <img>-less CSS backgrounds decode asynchronously;
       // give the compositor a frame before capturing.

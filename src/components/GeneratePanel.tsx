@@ -1,25 +1,17 @@
 "use client";
 
 import { useState } from "react";
+import { api } from "@/lib/api";
 import { THEMES } from "@/lib/themes";
-import { ASPECTS, type AspectId } from "@/lib/types";
+import { ASPECTS, type Asset, type AspectId } from "@/lib/types";
 import { Button, Field, Row, Section, Segmented, Select, TextArea, TextInput } from "./ui";
-
-export interface Asset {
-  id: string;
-  name: string;
-  mediaType: string;
-  /** Base64 without the data-URL prefix — what the Anthropic API wants. */
-  data: string;
-  /** Full data URL — what CSS wants. */
-  url: string;
-}
 
 export interface GenerateRequest {
   brief: string;
   sourceText?: string;
   sourceLabel?: string;
-  images?: { mediaType: string; data: string }[];
+  /** Uploads Claude should look at; the server reads the bytes. */
+  assetIds?: string[];
   slideCount: number;
   tone: string;
   audience?: string;
@@ -37,7 +29,8 @@ const TONES = [
   "playful and irreverent",
 ];
 
-const MAX_IMAGE_BYTES = 4.5 * 1024 * 1024;
+/** Mirrors the server limit so the failure is immediate and specific. */
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 export default function GeneratePanel({
   assets,
@@ -69,6 +62,8 @@ export default function GeneratePanel({
   const [extracted, setExtracted] = useState<{ title: string; text: string } | null>(null);
   const [extracting, setExtracting] = useState(false);
   const [extractError, setExtractError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [slideCount, setSlideCount] = useState(7);
   const [tone, setTone] = useState(TONES[0]);
   const [audience, setAudience] = useState("");
@@ -96,23 +91,25 @@ export default function GeneratePanel({
 
   async function handleFiles(files: FileList | null) {
     if (!files?.length) return;
-    const next: Asset[] = [];
-    for (const file of Array.from(files).slice(0, 6)) {
-      if (!file.type.startsWith("image/")) continue;
-      if (file.size > MAX_IMAGE_BYTES) {
-        alert(`${file.name} is over 4.5 MB — resize it first.`);
-        continue;
+    const chosen = Array.from(files).filter((file) => file.type.startsWith("image/"));
+    const tooBig = chosen.filter((file) => file.size > MAX_IMAGE_BYTES);
+    const uploadable = chosen.filter((file) => file.size <= MAX_IMAGE_BYTES);
+
+    setUploadError(tooBig.length ? `${tooBig[0].name} is over 10 MB — resize it first.` : null);
+    if (!uploadable.length) return;
+
+    setUploading(true);
+    try {
+      const result = await api.uploadAssets(uploadable);
+      if (result.assets.length) onAddAssets(result.assets);
+      if (result.failed?.length) {
+        setUploadError(`${result.failed[0].name}: ${result.failed[0].error}`);
       }
-      const url = await readAsDataUrl(file);
-      next.push({
-        id: `as_${Math.random().toString(36).slice(2, 9)}`,
-        name: file.name,
-        mediaType: file.type,
-        data: url.split(",")[1] ?? "",
-        url,
-      });
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : "Upload failed.");
+    } finally {
+      setUploading(false);
     }
-    if (next.length) onAddAssets(next);
   }
 
   function submit() {
@@ -129,7 +126,7 @@ export default function GeneratePanel({
       brief: brief.trim(),
       sourceText: sourceText || undefined,
       sourceLabel,
-      images: assets.map((a) => ({ mediaType: a.mediaType, data: a.data })),
+      assetIds: assets.map((asset) => asset.id),
       slideCount,
       tone,
       audience: audience.trim() || undefined,
@@ -253,8 +250,9 @@ export default function GeneratePanel({
               e.target.value = "";
             }}
           />
-          Upload images — Claude reads them, and you can drop them on any slide
+          {uploading ? "Uploading…" : "Upload images — Claude reads them, and you can drop them on any slide"}
         </label>
+        {uploadError && <p className="text-[11px] text-[#f27b7b]">{uploadError}</p>}
 
         {assets.length > 0 && (
           <div className="grid grid-cols-4 gap-2">
@@ -314,18 +312,10 @@ export default function GeneratePanel({
           {busy ? "Writing slides…" : "Generate carousel"}
         </Button>
         <p className="mt-2 text-center text-[10px] text-[#5f6674]">
-          Generating replaces the current deck. Undo brings it back.
+          Generating saves a new deck. The current one stays in your library.
         </p>
       </div>
     </div>
   );
 }
 
-function readAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-}
