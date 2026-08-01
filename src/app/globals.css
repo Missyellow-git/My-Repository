@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+@theme {
+  --color-shell: #0b0c0f;
+  --color-panel: #131519;
+  --color-panel-2: #1a1d23;
+  --color-line: #262a32;
+  --color-ink: #e9ecf1;
+  --color-dim: #8b93a1;
+  --color-brand: #7c6bff;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-shell);
+  color: var(--color-ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Thin scrollbars so panels don't get a heavy chrome gutter. */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2c313a;
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+input[type="color"] {
+  -webkit-appearance: none;
+  appearance: none;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="color"]::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+input[type="color"]::-webkit-color-swatch {
+  border: 1px solid var(--color-line);
+  border-radius: 6px;
+}
