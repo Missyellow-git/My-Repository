@@ -1,0 +1,242 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  # A new push supersedes the run in flight for the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  quality:
+    name: Lint, typecheck and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # The unit suite is pure and needs no services, but the API's Prisma client
+    # must be generated before anything type-checks, so a database URL is still
+    # required (it is never connected to).
+    env:
+      DATABASE_URL: postgresql://fundlens:fundlens@localhost:5432/fundlens?schema=public
+      REDIS_URL: redis://localhost:6379
+      JWT_ACCESS_SECRET: ci-access-secret-that-is-long-enough-for-validation
+      JWT_REFRESH_SECRET: ci-refresh-secret-that-is-long-enough-for-validation
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build shared contracts
+        # Everything downstream imports the built .d.ts, so this is first.
+        run: npm run build:shared
+
+      - name: Generate Prisma client
+        run: npx prisma generate --schema apps/api/prisma/schema.prisma
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test --workspace=@fundlens/api -- --ci --coverage --maxWorkers=2
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-coverage
+          path: apps/api/coverage
+          retention-days: 7
+
+  build:
+    name: Build applications
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: quality
+
+    env:
+      DATABASE_URL: postgresql://fundlens:fundlens@localhost:5432/fundlens?schema=public
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build:shared
+      - run: npx prisma generate --schema apps/api/prisma/schema.prisma
+
+      - name: Build API
+        run: npm run build --workspace=@fundlens/api
+
+      - name: Build web
+        run: npm run build --workspace=@fundlens/web
+
+  integration:
+    name: Migrations, seed and API smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: quality
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fundlens
+          POSTGRES_PASSWORD: fundlens
+          POSTGRES_DB: fundlens
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U fundlens"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+    env:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://fundlens:fundlens@localhost:5432/fundlens?schema=public
+      REDIS_URL: redis://localhost:6379
+      JWT_ACCESS_SECRET: ci-access-secret-that-is-long-enough-for-validation
+      JWT_REFRESH_SECRET: ci-refresh-secret-that-is-long-enough-for-validation
+      MARKET_DATA_PROVIDER: simulated
+      DISCLOSURE_PROVIDER: fixture
+      AI_ENABLED: 'false'
+      # The scheduler is exercised separately; leaving it off keeps the smoke
+      # test deterministic and stops it reaching out to AMFI from CI.
+      ENABLE_BACKGROUND_JOBS: 'false'
+      API_PORT: '4000'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build:shared
+      - run: npx prisma generate --schema apps/api/prisma/schema.prisma
+
+      - name: Apply migrations
+        working-directory: apps/api
+        # `migrate dev --create-only` on a fresh database generates the table
+        # migration from schema.prisma; the hand-written search-index migration
+        # then applies on top of it. See docs/DATABASE.md#migrations.
+        run: |
+          npx prisma migrate dev --name init --skip-seed --skip-generate
+          npx prisma migrate status
+
+      - name: Seed development data
+        working-directory: apps/api
+        run: npm run db:seed
+
+      - name: Build and start the API
+        run: |
+          npm run build --workspace=@fundlens/api
+          node apps/api/dist/main.js &
+          echo $! > api.pid
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4000/health > /dev/null; then break; fi
+            sleep 2
+          done
+
+      - name: Smoke test the public endpoints
+        run: |
+          set -euo pipefail
+
+          echo "--- health"
+          curl -fsS http://127.0.0.1:4000/health | tee /dev/stderr | grep -q '"status":"ok"'
+
+          echo "--- readiness"
+          curl -fsS http://127.0.0.1:4000/health/ready | grep -q '"database":true'
+
+          echo "--- scheme search returns the seeded fixtures"
+          FUND_ID=$(curl -fsS "http://127.0.0.1:4000/api/v1/funds/search?q=flexi%20cap" \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);if(!r.items.length)throw new Error('no search results');console.log(r.items[0].id)})")
+          echo "Resolved fund $FUND_ID"
+
+          echo "--- holdings carry snapshot metadata and price coverage"
+          curl -fsS "http://127.0.0.1:4000/api/v1/funds/$FUND_ID/holdings" \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);
+                if(!r.holdings.length) throw new Error('no holdings');
+                if(!r.snapshot.disclosureDate) throw new Error('missing disclosure date');
+                if(typeof r.priceCoverage.requested!=='number') throw new Error('missing price coverage');
+                console.log('holdings:',r.holdings.length,'priced:',r.priceCoverage.withQuote)})"
+
+          echo "--- analytics"
+          curl -fsS "http://127.0.0.1:4000/api/v1/funds/$FUND_ID/analytics" \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const a=JSON.parse(d);
+                if(!a.sectorAllocation.length) throw new Error('no sector allocation');
+                if(a.totalStocks<1) throw new Error('no stocks counted');
+                console.log('stocks:',a.totalStocks,'hhi:',a.concentrationHhi)})"
+
+          echo "--- the AI assistant answers without an LLM configured"
+          curl -fsS -X POST http://127.0.0.1:4000/api/v1/ai/query \
+            -H 'Content-Type: application/json' \
+            -d "{\"fundId\":\"$FUND_ID\",\"question\":\"Which stock has the highest weight in this fund?\"}" \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);
+                if(r.resolvedBy!=='rules') throw new Error('expected the deterministic parser, got '+r.resolvedBy);
+                if(!r.answer.rows||!r.answer.rows.length) throw new Error('no answer rows');
+                console.log('top holding:',r.answer.rows[0].instrumentName)})"
+
+          echo "--- CSV export"
+          curl -fsS "http://127.0.0.1:4000/api/v1/funds/$FUND_ID/export?format=csv" | head -5
+
+      - name: Stop the API
+        if: always()
+        run: kill "$(cat api.pid)" || true
+
+  docker:
+    name: Docker images build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

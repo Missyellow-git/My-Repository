@@ -1,0 +1,35 @@
+{
+  "name": "fundlens",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FundLens — live portfolio X-ray for Indian mutual fund schemes",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "npm run build --workspace=@fundlens/shared && npm run build --workspace=@fundlens/api && npm run build --workspace=@fundlens/web",
+    "build:shared": "npm run build --workspace=@fundlens/shared",
+    "dev": "npm run dev --workspace=@fundlens/api & npm run dev --workspace=@fundlens/web",
+    "dev:api": "npm run dev --workspace=@fundlens/api",
+    "dev:web": "npm run dev --workspace=@fundlens/web",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "test:cov": "npm run test:cov --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "format": "prettier --write \"{apps,packages}/**/*.{ts,tsx,json,md}\"",
+    "format:check": "prettier --check \"{apps,packages}/**/*.{ts,tsx,json,md}\"",
+    "db:generate": "npm run db:generate --workspace=@fundlens/api",
+    "db:migrate": "npm run db:migrate --workspace=@fundlens/api",
+    "db:seed": "npm run db:seed --workspace=@fundlens/api",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3"
+  }
+}

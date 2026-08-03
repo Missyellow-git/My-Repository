@@ -1,0 +1,109 @@
+# Local development and evaluation stack.
+#
+# `docker compose up -d --build` brings up Postgres, Redis, the API (with
+# migrations and seed applied) and the web app. Not a production topology —
+# see docs/DEPLOYMENT.md for that — but it is the same images.
+
+name: fundlens
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fundlens
+      POSTGRES_PASSWORD: fundlens
+      POSTGRES_DB: fundlens
+      # Faster and safe for a throwaway dev database; never set in production.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U fundlens -d fundlens']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # `--save ""` disables RDB snapshots: everything in this Redis is a cache or
+    # a queue that can be rebuilt, and disk snapshots only add latency spikes.
+    command: ['redis-server', '--save', '', '--appendonly', 'no', '--maxmemory', '256mb', '--maxmemory-policy', 'allkeys-lru']
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # Applies migrations and seeds, then exits. The API waits on it completing
+  # successfully, so the app never starts against an un-migrated schema.
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://fundlens:fundlens@postgres:5432/fundlens?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ['/bin/sh', '-c']
+    command: >
+      "npx prisma migrate deploy --schema prisma/schema.prisma &&
+       node -e \"require('child_process').execSync('npx prisma db seed', {stdio:'inherit'})\" || true"
+    restart: 'no'
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: info
+      API_PORT: 4000
+      CORS_ORIGINS: http://localhost:3000
+      DATABASE_URL: postgresql://fundlens:fundlens@postgres:5432/fundlens?schema=public
+      REDIS_URL: redis://redis:6379
+      # Development-only placeholders. `configuration.ts` rejects these when
+      # NODE_ENV=production, so replace them before any real deployment.
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET in .env}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET in .env}
+      MARKET_DATA_PROVIDER: ${MARKET_DATA_PROVIDER:-simulated}
+      MARKET_DATA_BASE_URL: ${MARKET_DATA_BASE_URL:-}
+      MARKET_DATA_API_KEY: ${MARKET_DATA_API_KEY:-}
+      DISCLOSURE_PROVIDER: ${DISCLOSURE_PROVIDER:-fixture}
+      AI_ENABLED: ${AI_ENABLED:-false}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ENABLE_BACKGROUND_JOBS: 'true'
+    ports:
+      - '4000:4000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Baked in at build time — the browser talks to the API directly, so
+        # this must be the URL as seen from the user's machine, not from
+        # inside the compose network.
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:4000/api/v1
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    depends_on:
+      - api
+
+volumes:
+  postgres-data:

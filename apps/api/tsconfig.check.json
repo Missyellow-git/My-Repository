@@ -1,0 +1,13 @@
+{
+  // Type-checks everything the build tsconfig deliberately excludes: the Prisma
+  // seed script, the test factories and the spec files. `npm run typecheck`
+  // runs this so nothing escapes the type checker just because it is not part
+  // of the shipped bundle.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "prisma/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

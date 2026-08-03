@@ -1,0 +1,477 @@
+// FundLens data model.
+//
+// Design notes that the rest of the codebase relies on:
+//  * Disclosures are immutable. A new monthly filing creates a new
+//    PortfolioSnapshot rather than mutating holdings, which is what makes the
+//    historical-comparison feature and the audit trail possible.
+//  * Money and weights use Decimal, never Float. Weights are stored as
+//    percentages with 4 decimal places (e.g. 7.4213 = 7.4213%).
+//  * Live quotes live in a single-row-per-stock table that is overwritten in
+//    place; the append-only history lives in DailyBar. Redis fronts this table
+//    so the hot read path rarely touches Postgres.
+//  * Every index below exists to serve a query in the codebase. See
+//    docs/DATABASE.md for the query → index mapping.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Reference data: AMCs, schemes
+// ---------------------------------------------------------------------------
+
+model Amc {
+  id            String       @id @default(uuid()) @db.Uuid
+  name          String       @unique
+  shortName     String?
+  amfiCode      String?      @unique
+  websiteUrl    String?
+  /// Key of the registered disclosure downloader adapter, e.g. "hdfc".
+  disclosureAdapter String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  funds         MutualFund[]
+
+  @@map("amcs")
+}
+
+model MutualFund {
+  id             String   @id @default(uuid()) @db.Uuid
+  amcId          String   @db.Uuid
+  amfiSchemeCode String?  @unique
+  name           String
+  /// Lowercased, punctuation-stripped name used for trigram search and for
+  /// de-duplicating the same scheme across data sources.
+  normalizedName String
+  category       String   @default("OTHER")
+  subCategory    String?
+  planType       String   @default("UNKNOWN")
+  optionType     String   @default("UNKNOWN")
+  isinGrowth     String?  @unique
+  isinDivReinv   String?  @unique
+  benchmark      String?
+  riskometer     String?
+  aumCrore       Decimal? @db.Decimal(16, 2)
+  latestNav      Decimal? @db.Decimal(16, 4)
+  latestNavDate  DateTime? @db.Date
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  amc            Amc                 @relation(fields: [amcId], references: [id], onDelete: Cascade)
+  snapshots      PortfolioSnapshot[]
+  favorites      FavoriteFund[]
+  alerts         AlertRule[]
+
+  /// Search path: ILIKE / trigram similarity on normalizedName.
+  /// The GIN trigram index itself is added in a raw migration (Prisma cannot
+  /// express `gin_trgm_ops`) — see migrations/.../trigram_search.sql.
+  @@index([normalizedName])
+  @@index([amcId])
+  @@index([category, planType])
+  @@index([isActive, category])
+  @@map("mutual_funds")
+}
+
+// ---------------------------------------------------------------------------
+// Reference data: sectors and listed securities
+// ---------------------------------------------------------------------------
+
+model Sector {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  /// AMFI/NSE macro grouping, e.g. "Financial Services".
+  macroSector String?
+  createdAt DateTime @default(now())
+
+  stocks    Stock[]
+
+  @@map("sectors")
+}
+
+model Stock {
+  id                String   @id @default(uuid()) @db.Uuid
+  name              String
+  /// Normalized company name — the join key when a disclosure has no ISIN.
+  normalizedName    String
+  isin              String?  @unique
+  nseSymbol         String?  @unique
+  bseCode           String?  @unique
+  sectorId          String?  @db.Uuid
+  industry          String?
+  marketCapCrore    Decimal? @db.Decimal(16, 2)
+  marketCapCategory String   @default("UNCLASSIFIED")
+  faceValue         Decimal? @db.Decimal(10, 2)
+  isActive          Boolean  @default(true)
+  /// When the market-cap/sector metadata was last refreshed.
+  metadataUpdatedAt DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  sector            Sector?          @relation(fields: [sectorId], references: [id], onDelete: SetNull)
+  holdings          Holding[]
+  price             StockPrice?
+  dailyBars         DailyBar[]
+  aliases           StockAlias[]
+  watchlistItems    WatchlistItem[]
+  alerts            AlertRule[]
+
+  @@index([normalizedName])
+  @@index([sectorId])
+  @@index([marketCapCategory])
+  @@index([isActive, nseSymbol])
+  @@map("stocks")
+}
+
+/// Alternate spellings seen in disclosures ("HDFC Bank Ltd.", "HDFC Bank
+/// Limited", "Housing Development Finance Corp Bank"). Populated by the mapper
+/// whenever a fuzzy match is confirmed, so the next import is an exact hit.
+model StockAlias {
+  id        String   @id @default(uuid()) @db.Uuid
+  stockId   String   @db.Uuid
+  alias     String
+  normalizedAlias String
+  /// "manual" | "auto" — auto aliases can be pruned; manual ones never are.
+  source    String   @default("auto")
+  createdAt DateTime @default(now())
+
+  stock     Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+
+  @@unique([normalizedAlias])
+  @@index([stockId])
+  @@map("stock_aliases")
+}
+
+// ---------------------------------------------------------------------------
+// Portfolio disclosures
+// ---------------------------------------------------------------------------
+
+model PortfolioSnapshot {
+  id              String   @id @default(uuid()) @db.Uuid
+  fundId          String   @db.Uuid
+  /// Month-end date the disclosure represents (not the publication date).
+  disclosureDate  DateTime @db.Date
+  status          String   @default("PENDING")
+  /// Adapter that produced this snapshot, e.g. "amfi", "amc:hdfc", "fixture".
+  source          String
+  sourceUrl       String?
+  /// SHA-256 of the parsed rows; identical checksums short-circuit re-imports.
+  checksum        String?
+  totalAumCrore   Decimal? @db.Decimal(16, 2)
+  holdingsCount   Int      @default(0)
+  equityCount     Int      @default(0)
+  totalEquityWeightPct Decimal @default(0) @db.Decimal(9, 4)
+  /// Count of disclosure lines that could not be mapped to a Stock.
+  unmappedCount   Int      @default(0)
+  parseWarnings   Json?
+  importedAt      DateTime @default(now())
+  publishedAt     DateTime?
+
+  fund            MutualFund @relation(fields: [fundId], references: [id], onDelete: Cascade)
+  holdings        Holding[]
+
+  /// One snapshot per fund per disclosure period; re-imports update in place.
+  @@unique([fundId, disclosureDate])
+  /// Serves "latest published snapshot for this fund" — the hottest query.
+  @@index([fundId, status, disclosureDate(sort: Desc)])
+  @@index([disclosureDate(sort: Desc)])
+  @@map("portfolio_snapshots")
+}
+
+model Holding {
+  id              String   @id @default(uuid()) @db.Uuid
+  snapshotId      String   @db.Uuid
+  /// Null when the line is cash/TREPS or could not be mapped to a security.
+  stockId         String?  @db.Uuid
+  /// Instrument name exactly as printed in the disclosure. Preserved verbatim
+  /// so we can re-run mapping later without re-downloading the source file.
+  instrumentName  String
+  isin            String?
+  instrumentType  String   @default("EQUITY")
+  quantity        Decimal? @db.Decimal(20, 4)
+  marketValueLakh Decimal? @db.Decimal(18, 4)
+  /// Percentage of net assets, 4dp. Source of truth for all weight maths.
+  weightPct       Decimal  @db.Decimal(9, 4)
+  /// 1-based position by descending weight within the snapshot.
+  rank            Int
+  /// 0–1. 1.0 = ISIN match, lower values come from fuzzy name matching.
+  mappingConfidence Decimal? @db.Decimal(4, 3)
+  createdAt       DateTime @default(now())
+
+  snapshot        PortfolioSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  stock           Stock?            @relation(fields: [stockId], references: [id], onDelete: SetNull)
+
+  /// Primary dashboard read: holdings of a snapshot ordered by weight.
+  @@index([snapshotId, weightPct(sort: Desc)])
+  /// Reverse lookup: "which funds hold this stock".
+  @@index([stockId])
+  @@index([snapshotId, instrumentType])
+  @@map("holdings")
+}
+
+// ---------------------------------------------------------------------------
+// Market data
+// ---------------------------------------------------------------------------
+
+/// Latest known quote per stock. Overwritten in place; Redis is the read path.
+model StockPrice {
+  stockId     String   @id @db.Uuid
+  exchange    String   @default("NSE")
+  ltp         Decimal? @db.Decimal(14, 4)
+  open        Decimal? @db.Decimal(14, 4)
+  high        Decimal? @db.Decimal(14, 4)
+  low         Decimal? @db.Decimal(14, 4)
+  prevClose   Decimal? @db.Decimal(14, 4)
+  change      Decimal? @db.Decimal(14, 4)
+  changePct   Decimal? @db.Decimal(9, 4)
+  volume      BigInt?
+  week52High  Decimal? @db.Decimal(14, 4)
+  week52Low   Decimal? @db.Decimal(14, 4)
+  week52Avg   Decimal? @db.Decimal(14, 4)
+  /// Exchange-reported quote time. Staleness is measured against this, not
+  /// against fetchedAt — a provider can return old data quickly.
+  quotedAt    DateTime?
+  fetchedAt   DateTime @default(now())
+  source      String   @default("unknown")
+  /// Consecutive fetch failures; drives circuit-breaker style backoff.
+  failureCount Int     @default(0)
+
+  stock       Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+
+  @@index([fetchedAt])
+  @@map("stock_prices")
+}
+
+/// Append-only daily OHLC, used for the 52-week average and for charts.
+model DailyBar {
+  id        String   @id @default(uuid()) @db.Uuid
+  stockId   String   @db.Uuid
+  date      DateTime @db.Date
+  open      Decimal? @db.Decimal(14, 4)
+  high      Decimal? @db.Decimal(14, 4)
+  low       Decimal? @db.Decimal(14, 4)
+  close     Decimal  @db.Decimal(14, 4)
+  volume    BigInt?
+  createdAt DateTime @default(now())
+
+  stock     Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+
+  @@unique([stockId, date])
+  @@index([stockId, date(sort: Desc)])
+  @@map("daily_bars")
+}
+
+/// Exchange holiday calendar. Absence of a row means "trading day".
+model MarketHoliday {
+  date        DateTime @id @db.Date
+  description String
+  exchange    String   @default("NSE")
+
+  @@map("market_holidays")
+}
+
+// ---------------------------------------------------------------------------
+// Operations: provider call logs, job runs, audit trail
+// ---------------------------------------------------------------------------
+
+/// One row per outbound third-party call. Feeds the provider dashboards and
+/// gives us the evidence trail regulators expect for a market-data licence.
+model ApiCallLog {
+  id           BigInt   @id @default(autoincrement())
+  provider     String
+  endpoint     String
+  method       String   @default("GET")
+  httpStatus   Int?
+  /// "ok" | "error" | "timeout" | "rate_limited" | "cache_hit"
+  outcome      String
+  latencyMs    Int?
+  /// Number of securities requested in this call — for cost attribution.
+  itemCount    Int?
+  errorMessage String?
+  requestId    String?
+  createdAt    DateTime @default(now())
+
+  @@index([provider, createdAt(sort: Desc)])
+  @@index([outcome, createdAt(sort: Desc)])
+  @@map("api_call_logs")
+}
+
+model SyncJobRun {
+  id         String    @id @default(uuid()) @db.Uuid
+  jobName    String
+  status     String    @default("RUNNING")
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  /// Free-form counters: { processed, created, updated, skipped, failed }.
+  stats      Json?
+  error      String?
+
+  @@index([jobName, startedAt(sort: Desc)])
+  @@map("sync_job_runs")
+}
+
+/// Security-relevant user and system actions. Write-only from the app's
+/// perspective; retention and export are handled by ops tooling.
+model AuditLog {
+  id         BigInt   @id @default(autoincrement())
+  userId     String?  @db.Uuid
+  action     String
+  entityType String?
+  entityId   String?
+  ipAddress  String?
+  userAgent  String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Accounts (optional — the product is fully usable signed out)
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  passwordHash String
+  displayName  String?
+  role         String   @default("USER")
+  isActive     Boolean  @default(true)
+  emailVerifiedAt DateTime?
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  preference     UserPreference?
+  favorites      FavoriteFund[]
+  watchlists     Watchlist[]
+  alerts         AlertRule[]
+  notifications  Notification[]
+  refreshTokens  RefreshToken[]
+  auditLogs      AuditLog[]
+
+  @@map("users")
+}
+
+/// Refresh tokens are stored hashed so a database leak cannot mint sessions.
+model RefreshToken {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @db.Uuid
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime @default(now())
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@map("refresh_tokens")
+}
+
+model UserPreference {
+  userId              String  @id @db.Uuid
+  priceRefreshSeconds Int     @default(60)
+  defaultFundId       String? @db.Uuid
+  theme               String  @default("system")
+  emailNotifications  Boolean @default(true)
+  updatedAt           DateTime @updatedAt
+
+  user                User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+}
+
+model FavoriteFund {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  fundId    String   @db.Uuid
+  createdAt DateTime @default(now())
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fund      MutualFund @relation(fields: [fundId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, fundId])
+  @@index([userId])
+  @@map("favorite_funds")
+}
+
+model Watchlist {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items     WatchlistItem[]
+
+  @@unique([userId, name])
+  @@map("watchlists")
+}
+
+model WatchlistItem {
+  id          String   @id @default(uuid()) @db.Uuid
+  watchlistId String   @db.Uuid
+  stockId     String   @db.Uuid
+  createdAt   DateTime @default(now())
+
+  watchlist   Watchlist @relation(fields: [watchlistId], references: [id], onDelete: Cascade)
+  stock       Stock     @relation(fields: [stockId], references: [id], onDelete: Cascade)
+
+  @@unique([watchlistId, stockId])
+  @@map("watchlist_items")
+}
+
+model AlertRule {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @db.Uuid
+  type            String
+  channel         String   @default("IN_APP")
+  fundId          String?  @db.Uuid
+  stockId         String?  @db.Uuid
+  thresholdPct    Decimal? @db.Decimal(6, 2)
+  isActive        Boolean  @default(true)
+  lastTriggeredAt DateTime?
+  /// Suppresses repeat firing within the same window.
+  cooldownMinutes Int      @default(60)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user            User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fund            MutualFund? @relation(fields: [fundId], references: [id], onDelete: Cascade)
+  stock           Stock?      @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  notifications   Notification[]
+
+  /// The alert evaluator scans active rules by type.
+  @@index([isActive, type])
+  @@index([userId])
+  @@map("alert_rules")
+}
+
+model Notification {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @db.Uuid
+  alertRuleId String?  @db.Uuid
+  title       String
+  body        String
+  payload     Json?
+  readAt      DateTime?
+  createdAt   DateTime @default(now())
+
+  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  alertRule   AlertRule? @relation(fields: [alertRuleId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, readAt])
+  @@map("notifications")
+}

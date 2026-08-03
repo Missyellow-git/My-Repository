@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "declaration": false,
+    "removeComments": false,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "sourceMap": true,
+    "outDir": "./dist",
+    // Pinned so the emitted tree is dist/main.js rather than a nested path
+    // derived from whatever the widest included directory happens to be.
+    "rootDir": "./src",
+    "baseUrl": "./",
+    "incremental": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "strictBindCallApply": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "src/*": ["src/*"]
+    }
+  },
+  // `@fundlens/shared` deliberately resolves through node_modules (the npm
+  // workspace symlink) to its built .d.ts rather than through a path alias to
+  // the source. A source alias would drag packages/ into this project's root
+  // directory and nest the entire build output one level deeper.
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "test", "src/**/*.spec.ts", "src/test-utils/**"]
+}
